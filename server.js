@@ -1,6 +1,6 @@
 // ============================================
-// RC RECORDS SERVER — v3.6
-// Ledger + Registries + Purchase from Cash Request + Tax Withholding
+// RC RECORDS SERVER — v3.7
+// Ledger + Registries + Purchase from Cash Request + Tax Withholding + Crypto Wallet
 // Modules decide. Server validates, executes, records.
 // Neural Ledger is the single source of truth.
 // ============================================
@@ -71,7 +71,9 @@ db.serialize(() => {
         registered_at INTEGER,
         expiry_date TEXT,
         status TEXT DEFAULT 'active',
-        client_secret TEXT
+        client_secret TEXT,
+        crypto_wallet TEXT,
+        crypto_network TEXT
     )`);
 
     db.run(`CREATE TABLE IF NOT EXISTS balances (
@@ -550,14 +552,16 @@ async function applyLedgerEntry(entry) {
         case 'USER_REGISTERED':
             if (extra.wallet) {
                 await dbRun(
-                    `INSERT OR REPLACE INTO members (wallet, eth, name, username, email, phone, address, role, tier, amount_paid, token_balance, registered_at, expiry_date, status, client_secret)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    `INSERT OR REPLACE INTO members (wallet, eth, name, username, email, phone, address, role, tier, amount_paid, token_balance, registered_at, expiry_date, status, client_secret, crypto_wallet, crypto_network)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [extra.wallet, extra.eth || '', extra.name || '', extra.username || '',
                      extra.email || '', extra.phone || '', extra.address || '',
                      extra.role || 'user', extra.tier || 1, extra.amount_paid || 0,
                      extra.token_amount || 0, extra.registered_at || entry.timestamp,
                      extra.expiry_date || '', extra.status || 'active',
-                     extra.client_secret || null]
+                     extra.client_secret || null,
+                     extra.crypto_wallet || null,
+                     extra.crypto_network || null]
                 );
             }
             break;
@@ -689,6 +693,16 @@ async function applyLedgerEntry(entry) {
         case 'VOUCHER_REDEEMED':
             if (extra.code) {
                 await dbRun(`UPDATE vouchers SET used_count = used_count + 1 WHERE code = ?`, [extra.code]);
+            }
+            break;
+
+        case 'CRYPTO_WALLET_SET':
+        case 'CRYPTO_WALLET_UPDATED':
+            if (entry.to_wallet && extra.crypto_wallet) {
+                await dbRun(
+                    `UPDATE members SET crypto_wallet = ?, crypto_network = ? WHERE wallet = ?`,
+                    [extra.crypto_wallet, extra.crypto_network || '', entry.to_wallet]
+                );
             }
             break;
 
@@ -1718,6 +1732,49 @@ async function handlePolicyUpdated(packet) {
 }
 
 // ============================================
+// HANDLERS — CRYPTO WALLET
+// ============================================
+async function handleCryptoWalletSet(packet) {
+    const { to_wallet, crypto_wallet, crypto_network } = packet;
+
+    if (!to_wallet) {
+        return { success: false, error: 'Member wallet required' };
+    }
+    if (!crypto_wallet) {
+        return { success: false, error: 'Crypto wallet address required' };
+    }
+
+    const rules = {
+        trc20: /^T[a-zA-Z0-9]{33}$/,
+        bep20: /^0x[a-fA-F0-9]{40}$/,
+        celo:  /^0x[a-fA-F0-9]{40}$/
+    };
+    if (crypto_network && rules[crypto_network] && !rules[crypto_network].test(crypto_wallet)) {
+        return { success: false, error: 'Address does not match the selected network.' };
+    }
+
+    const existing = await dbGet('SELECT crypto_wallet FROM members WHERE wallet = ?', [to_wallet]);
+    const isUpdate = existing && existing.crypto_wallet;
+
+    await addToLedger({
+        type: isUpdate ? 'CRYPTO_WALLET_UPDATED' : 'CRYPTO_WALLET_SET',
+        from: packet.from_wallet || 'ADMIN',
+        to: to_wallet,
+        amount: 0,
+        token: 'RGT',
+        extra: {
+            crypto_wallet,
+            crypto_network: crypto_network || '',
+            previous_wallet: isUpdate ? existing.crypto_wallet : null
+        },
+        debit: false,
+        credit: false
+    });
+
+    return { success: true, updated: !!isUpdate };
+}
+
+// ============================================
 // HANDLERS — PURCHASE (CASH REQUEST → STABLECOIN)
 // ============================================
 async function handlePurchaseQuote(packet) {
@@ -2453,6 +2510,9 @@ async function routePacket(packet) {
             case 'PROCESSOR_CONNECTED':       result = await handleProcessorConnected(packet); break;
             case 'POLICY_UPDATED':            result = await handlePolicyUpdated(packet); break;
 
+            case 'CRYPTO_WALLET_SET':         result = await handleCryptoWalletSet(packet); break;
+            case 'CRYPTO_WALLET_UPDATED':     result = await handleCryptoWalletSet(packet); break;
+
             case 'PURCHASE_QUOTE':            result = await handlePurchaseQuote(packet); break;
             case 'PURCHASE_EXECUTE':          result = await handlePurchaseExecute(packet); break;
 
@@ -2546,7 +2606,8 @@ const FILE_MAP = {
     '/correspondence': 'correspondence.html',
     '/voucher': 'voucher.html',
     '/works': 'work registry.html',
-    '/merch': 'merch registry.html'
+    '/merch': 'merch registry.html',
+    '/members': 'membership registry.html'
 };
 
 Object.entries(FILE_MAP).forEach(([route, filename]) => {
