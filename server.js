@@ -1,5 +1,6 @@
 // ============================================
-// RC RECORDS SERVER — v3.3 (Ledger + Registries)
+// RC RECORDS SERVER — v3.6
+// Ledger + Registries + Purchase from Cash Request + Tax Withholding
 // Modules decide. Server validates, executes, records.
 // Neural Ledger is the single source of truth.
 // ============================================
@@ -281,6 +282,36 @@ db.serialize(() => {
         registered_at INTEGER
     )`);
 
+    db.run(`CREATE TABLE IF NOT EXISTS purchase_quotes (
+        quote_id TEXT PRIMARY KEY,
+        cash_request_id TEXT,
+        provider TEXT,
+        network TEXT,
+        asset TEXT,
+        amount_ngn REAL,
+        destination TEXT,
+        rate REAL,
+        fee_ngn REAL,
+        receive_amount REAL,
+        expires_at TEXT,
+        status TEXT DEFAULT 'open',
+        created_at INTEGER,
+        wallet TEXT
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS tax_withholding (
+        id TEXT PRIMARY KEY,
+        cash_request_id TEXT,
+        quote_id TEXT,
+        wallet TEXT,
+        amount_ngn REAL,
+        amount_token REAL,
+        asset TEXT,
+        status TEXT DEFAULT 'withheld',
+        created_at INTEGER,
+        remitted_at INTEGER
+    )`);
+
     console.log(`✅ Database ready: ${DB_FILE} (WAL mode)`);
 });
 
@@ -376,6 +407,54 @@ async function isBlacklisted(wallet) {
     const row = await dbGet('SELECT status FROM members WHERE wallet = ?', [wallet]);
     return row && row.status === 'blacklisted';
 }
+
+// ============================================
+// PURCHASE RATE + EXECUTION HELPERS
+// ============================================
+async function lookupPurchaseRate({ asset, network, amount_ngn }) {
+    const base = 1520.50;
+    const fee_ngn = Math.max(750, amount_ngn * 0.015);
+    const receive_amount = ((amount_ngn - fee_ngn) / base);
+    return {
+        rate: base,
+        fee_ngn: Math.round(fee_ngn),
+        receive_amount: Number(receive_amount.toFixed(6))
+    };
+}
+
+async function executePurchase({ quote, destination, network }) {
+    try {
+        // Replace this block with the real provider call when ready.
+        const transaction_id = 'PROV-' + Date.now();
+        return { ok: true, transaction_id };
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+}
+
+async function reimburseTaxToUser(quote, stampDutyNgn, stampDutyToken) {
+    try {
+        const reimburseResult = await executePurchase({
+            quote: {
+                ...quote,
+                amount_ngn: stampDutyNgn,
+                receive_amount: stampDutyToken
+            },
+            destination: quote.destination,
+            network: quote.network
+        });
+
+        if (!reimburseResult.ok) {
+            console.warn('⚠️ Tax reimbursement failed:', reimburseResult.error);
+            return { ok: false, error: reimburseResult.error };
+        }
+
+        return { ok: true, transaction_id: reimburseResult.transaction_id };
+    } catch (err) {
+        return { ok: false, error: err.message };
+    }
+}
+
 // ============================================
 // LEDGER
 // ============================================
@@ -459,7 +538,7 @@ async function queueForFallbackSync(txId, entry) {
 }
 
 // ============================================
-// LEDGER REPLAY — rebuild all state from ledger
+// LEDGER REPLAY
 // ============================================
 async function applyLedgerEntry(entry) {
     const extra = typeof entry.extra === 'string'
@@ -686,6 +765,48 @@ async function applyLedgerEntry(entry) {
             break;
 
         case 'REGISTRY_SYNC':
+            break;
+
+        case 'PURCHASE_QUOTE_CREATED':
+            break;
+
+        case 'PURCHASE_EXECUTED':
+            if (extra.quote_id) {
+                await dbRun('UPDATE purchase_quotes SET status = ? WHERE quote_id = ?',
+                            ['executed', extra.quote_id]);
+            }
+            if (extra.cash_request_id) {
+                await dbRun('UPDATE pending_cashouts SET status = ? WHERE id = ?',
+                            ['fulfilled', extra.cash_request_id]);
+            }
+            break;
+
+        case 'PURCHASE_FAILED':
+            if (extra.quote_id) {
+                await dbRun('UPDATE purchase_quotes SET status = ? WHERE quote_id = ?',
+                            ['failed', extra.quote_id]);
+            }
+            if (extra.cash_request_id) {
+                await dbRun('UPDATE pending_cashouts SET status = ? WHERE id = ?',
+                            ['failed', extra.cash_request_id]);
+            }
+            break;
+
+        case 'TAX_WITHHELD':
+            break;
+
+        case 'TAX_REIMBURSED':
+            if (extra.cash_request_id) {
+                await dbRun('UPDATE tax_withholding SET status = ? WHERE cash_request_id = ?',
+                            ['reimbursed', extra.cash_request_id]);
+            }
+            break;
+
+        case 'TAX_REMITTED':
+            if (extra.batch_id) {
+                await dbRun('UPDATE tax_withholding SET status = ?, remitted_at = ? WHERE status = ?',
+                            ['remitted', Date.now(), 'reimbursed']);
+            }
             break;
 
         case 'WORK_REGISTER':
@@ -1597,6 +1718,202 @@ async function handlePolicyUpdated(packet) {
 }
 
 // ============================================
+// HANDLERS — PURCHASE (CASH REQUEST → STABLECOIN)
+// ============================================
+async function handlePurchaseQuote(packet) {
+    const { cash_request_id, asset, destination, network, provider } = packet;
+
+    if (!cash_request_id) {
+        return { ok: false, message: 'Cash request ID required.' };
+    }
+
+    const cashRequest = await dbGet('SELECT * FROM pending_cashouts WHERE id = ?', [cash_request_id]);
+    if (!cashRequest) {
+        return { ok: false, message: 'Cash request not found.' };
+    }
+    if (cashRequest.status === 'fulfilled') {
+        return { ok: false, message: 'Cash request already fulfilled.' };
+    }
+
+    const allowed = { celo: ['USDC'], bep20: ['USDT'], trc20: ['USDT'] };
+    if (!allowed[network] || !allowed[network].includes(asset)) {
+        return { ok: false, message: 'Asset not available on that network.' };
+    }
+
+    const rules = {
+        celo:  /^0x[a-fA-F0-9]{40}$/,
+        bep20: /^0x[a-fA-F0-9]{40}$/,
+        trc20: /^T[a-zA-Z0-9]{33}$/
+    };
+    if (!rules[network] || !rules[network].test(destination)) {
+        return { ok: false, message: 'Destination address invalid for network.' };
+    }
+
+    const amount = parseFloat(cashRequest.amount);
+    if (isNaN(amount) || amount <= 0) {
+        return { ok: false, message: 'Invalid cash amount.' };
+    }
+
+    const quote = await lookupPurchaseRate({ asset, network, amount_ngn: amount });
+    const quote_id = 'RC-Q-' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+    const expires_at = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    await dbRun(
+        `INSERT INTO purchase_quotes
+         (quote_id, cash_request_id, provider, network, asset, amount_ngn, destination,
+          rate, fee_ngn, receive_amount, expires_at, status, created_at, wallet)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [quote_id, cash_request_id, provider, network, asset, amount, destination,
+         quote.rate, quote.fee_ngn, quote.receive_amount,
+         expires_at, 'open', Date.now(), cashRequest.wallet]
+    );
+
+    await addToLedger({
+        type: 'PURCHASE_QUOTE_CREATED',
+        from: 'BANKING_API',
+        to: 'PURCHASE_QUOTE',
+        amount: amount,
+        token: asset,
+        extra: { quote_id, cash_request_id, provider, network, destination },
+        debit: false,
+        credit: false
+    });
+
+    return {
+        ok: true, quote_id, cash_request_id, asset,
+        amount_ngn: amount,
+        rate: quote.rate, fee_ngn: quote.fee_ngn,
+        receive_amount: quote.receive_amount,
+        expires_at
+    };
+}
+
+async function handlePurchaseExecute(packet) {
+    const { quote_id } = packet;
+    const quote = await dbGet('SELECT * FROM purchase_quotes WHERE quote_id = ?', [quote_id]);
+    if (!quote) return { ok: false, message: 'Quote not found.' };
+    if (quote.status !== 'open') return { ok: false, message: 'Quote already used.' };
+    if (Date.now() > new Date(quote.expires_at).getTime()) {
+        await dbRun('UPDATE purchase_quotes SET status = ? WHERE quote_id = ?', ['expired', quote_id]);
+        return { ok: false, message: 'Quote expired.' };
+    }
+
+    const result = await executePurchase({
+        quote,
+        destination: quote.destination,
+        network: quote.network
+    });
+
+    if (!result.ok) {
+        await dbRun('UPDATE purchase_quotes SET status = ? WHERE quote_id = ?', ['failed', quote_id]);
+        await dbRun('UPDATE pending_cashouts SET status = ? WHERE id = ?', ['failed', quote.cash_request_id]);
+        await addToLedger({
+            type: 'PURCHASE_FAILED',
+            from: 'BANKING_API',
+            to: 'PURCHASE_QUOTE',
+            amount: quote.amount_ngn,
+            token: quote.asset,
+            extra: { quote_id, cash_request_id: quote.cash_request_id, error: result.error },
+            debit: false, credit: false
+        });
+        return { ok: false, message: result.error };
+    }
+
+    await dbRun('UPDATE purchase_quotes SET status = ? WHERE quote_id = ?', ['executed', quote_id]);
+    await dbRun('UPDATE pending_cashouts SET status = ? WHERE id = ?', ['fulfilled', quote.cash_request_id]);
+
+    const reference = 'RC-PUR-' + Date.now();
+    await addToLedger({
+        type: 'PURCHASE_EXECUTED',
+        from: 'BANKING_API',
+        to: 'USER_WALLET',
+        amount: quote.amount_ngn,
+        token: quote.asset,
+        extra: {
+            reference, quote_id,
+            cash_request_id: quote.cash_request_id,
+            provider: quote.provider,
+            network: quote.network,
+            destination: quote.destination,
+            transaction_id: result.transaction_id
+        },
+        debit: false, credit: false
+    });
+
+    const stampDutyNgn = Math.round(quote.amount_ngn * 0.015);
+    const stampDutyToken = Number((stampDutyNgn / quote.rate).toFixed(6));
+
+    await dbRun(
+        `INSERT INTO tax_withholding
+         (id, cash_request_id, quote_id, wallet, amount_ngn, amount_token, asset,
+          status, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [
+            'TAX_' + Date.now(),
+            quote.cash_request_id,
+            quote_id,
+            quote.wallet,
+            stampDutyNgn,
+            stampDutyToken,
+            quote.asset,
+            'withheld',
+            Date.now()
+        ]
+    );
+
+    await addToLedger({
+        type: 'TAX_WITHHELD',
+        from: 'USER_WALLET',
+        to: 'TAX_VAULT',
+        amount: stampDutyNgn,
+        token: quote.asset,
+        extra: {
+            quote_id,
+            cash_request_id: quote.cash_request_id,
+            stamp_duty_ngn: stampDutyNgn,
+            stamp_duty_token: stampDutyToken
+        },
+        debit: false, credit: false
+    });
+
+    const reimburse = await reimburseTaxToUser(quote, stampDutyNgn, stampDutyToken);
+
+    if (reimburse.ok) {
+        await dbRun('UPDATE tax_withholding SET status = ? WHERE cash_request_id = ?',
+                    ['reimbursed', quote.cash_request_id]);
+
+        await addToLedger({
+            type: 'TAX_REIMBURSED',
+            from: 'PLATFORM_OPERATING',
+            to: 'USER_WALLET',
+            amount: stampDutyNgn,
+            token: quote.asset,
+            extra: {
+                quote_id,
+                cash_request_id: quote.cash_request_id,
+                reimbursement_tx: reimburse.transaction_id,
+                note: 'Platform absorbs stamp duty on behalf of user'
+            },
+            debit: false, credit: false
+        });
+    }
+
+    return {
+        ok: true, reference,
+        cash_request_id: quote.cash_request_id,
+        provider: quote.provider,
+        network: quote.network,
+        asset: quote.asset,
+        amount_ngn: quote.amount_ngn,
+        received_amount: quote.receive_amount,
+        stamp_duty_ngn: stampDutyNgn,
+        stamp_duty_reimbursed: reimburse.ok,
+        status: 'COMPLETED',
+        transaction_id: result.transaction_id
+    };
+}
+
+// ============================================
 // HANDLERS — VOUCHERS
 // ============================================
 async function handleVoucherGenerate(packet) {
@@ -2071,6 +2388,7 @@ async function handleMerchRegister(packet) {
 
     return { success: true, merch_id: merchId, catalog_id: catalogId, merch_type };
 }
+
 // ============================================
 // ROUTER
 // ============================================
@@ -2134,6 +2452,9 @@ async function routePacket(packet) {
             case 'BANKING_SYNC':              result = await handleBankingSync(packet); break;
             case 'PROCESSOR_CONNECTED':       result = await handleProcessorConnected(packet); break;
             case 'POLICY_UPDATED':            result = await handlePolicyUpdated(packet); break;
+
+            case 'PURCHASE_QUOTE':            result = await handlePurchaseQuote(packet); break;
+            case 'PURCHASE_EXECUTE':          result = await handlePurchaseExecute(packet); break;
 
             case 'VOUCHER_GENERATE':          result = await handleVoucherGenerate(packet); break;
             case 'VOUCHER_REDEEM':            result = await handleVoucherRedeem(packet); break;
@@ -2307,6 +2628,29 @@ app.post('/api/packet', async (req, res) => {
 });
 
 // ============================================
+// API — PURCHASE
+// ============================================
+app.post('/api/purchase/quote', async (req, res) => {
+    try {
+        const packet = { type: 'PURCHASE_QUOTE', from_wallet: 'ADMIN_VAULT', ...req.body };
+        const result = await routePacket(packet);
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ ok: false, message: error.message });
+    }
+});
+
+app.post('/api/purchase/execute', async (req, res) => {
+    try {
+        const packet = { type: 'PURCHASE_EXECUTE', from_wallet: 'ADMIN_VAULT', ...req.body };
+        const result = await routePacket(packet);
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ ok: false, message: error.message });
+    }
+});
+
+// ============================================
 // API — READS
 // ============================================
 app.get('/api/ledger', async (req, res) => {
@@ -2357,6 +2701,22 @@ app.get('/api/registrations/pending', async (req, res) => {
         const rows = await dbAll(`SELECT * FROM pending_registrations WHERE status = 'pending' ORDER BY submitted_at DESC`);
         res.json({ success: true, count: rows.length, registrations: rows });
     } catch (error) { res.status(400).json({ success: false, error: error.message }); }
+});
+
+app.get('/api/cashouts/:id', async (req, res) => {
+    try {
+        const cashout = await dbGet('SELECT * FROM pending_cashouts WHERE id = ?', [req.params.id]);
+        if (!cashout) return res.json({ ok: false, message: 'Cash request not found.' });
+        res.json({
+            ok: true,
+            id: cashout.id,
+            wallet: cashout.wallet,
+            amount: cashout.amount,
+            status: cashout.status
+        });
+    } catch (error) {
+        res.status(400).json({ ok: false, message: error.message });
+    }
 });
 
 // ============================================
